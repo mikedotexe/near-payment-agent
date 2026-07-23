@@ -1,0 +1,33 @@
+[package]
+name = "near-payment-agent"
+version = "0.1.0"
+edition = "2021"
+# Pin to the installed toolchain; the MSRV-aware resolver below then selects
+# near-sdk versions compatible with it (latest near-sdk targets a newer rustc).
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/mikedotexe/near-payment-agent"
+description = "Least-privilege NEP-141 payment-agent for NEAR: a method-scoped, capped payment authority a custodian/agent drives with a function-call key — never full-access."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Single-crate workspace root, opting into the MSRV-aware dependency resolver so
+# `cargo` picks the newest dependency versions whose rust-version <= ours.
+[workspace]
+resolver = "3"
+
+[dependencies]
+near-sdk = "5"
+
+[dev-dependencies]
+near-sdk = { version = "5", features = ["unit-testing"] }
+
+# Reproducible, overflow-checked release profile (the caps rely on checked math).
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true

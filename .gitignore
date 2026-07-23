@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# cargo-near artifacts
+*.wasm
+
+# Editor/OS cruft
+.DS_Store
+
+# NOTE: Cargo.lock IS committed — reproducible builds and an attestable code
+# hash depend on a pinned dependency graph.
