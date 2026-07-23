@@ -32,8 +32,9 @@ Identical to `exact` except step 3/7:
 1. Client requests a protected resource.
 2. Server responds `402` with `PAYMENT-REQUIRED` (v2 `PaymentRequired`, `scheme = "exact-agent"`).
 3. Client constructs a NEP-366 `SignedDelegateAction` whose single action is a
-   `FunctionCall` to **`pay(recipient=payTo, amount)`** on the client's own agent
-   contract, `deposit = 0`, signed by a **function-call key scoped to `pay`**.
+   `FunctionCall` to **`pay(recipient=payTo, amount, payment_id)`** on the client's
+   own agent contract, `deposit = 0`, signed by a **function-call key scoped to
+   `pay`**. `payment_id` is an idempotency key the contract deduplicates.
 4. Client retries with `PAYMENT-SIGNATURE`.
 5. Server calls facilitator `verify`.
 6. On success, server calls facilitator `settle`.
@@ -75,7 +76,9 @@ A fork of the `exact` verify. Same envelope checks (network, expiry via
 - **Method**: `functionCall.methodName == "pay"` (not `ft_transfer`).
 - **Target is the agent, self-called**: `delegate.receiverId == delegate.senderId`
   (the agent account). *(Inverse of exact, where `receiverId == asset`.)*
-- **Args**: parse `pay` args → `recipient == payTo`, `amount == requirements.amount`.
+- **Args**: parse `pay` args → `recipient == payTo`, `amount == requirements.amount`;
+  `payment_id` present (the contract dedups it — the facilitator SHOULD bind it to
+  the x402 payment nonce for end-to-end idempotency).
 - **Deposit is ZERO**: `functionCall.deposit == 0`. *(Inverse of exact's 1-yocto.)*
 - **Key is a scoped function-call key**: read `view_access_key`; require a
   `FunctionCall` permission with `receiver_id == agentContractId` and `method_names`

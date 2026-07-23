@@ -15,20 +15,17 @@
 //! See `docs/design.md` and `docs/threat-model.md`.
 
 use near_sdk::json_types::{U128, U64};
-use near_sdk::store::LookupSet;
+use near_sdk::store::{LookupSet};
 use near_sdk::{
     assert_one_yocto, env, ext_contract, near, require, AccountId, Allowance, Gas, NearToken,
     PanicOnDefault, Promise, PromiseError, PublicKey,
 };
 
-/// Static gas for the spawned `ft_transfer` and the resolve callback.
 const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
 const GAS_FT_RESOLVE: Gas = Gas::from_tgas(10);
-
 const EVENT_STANDARD: &str = "payment_agent";
 const EVENT_VERSION: &str = "1.0.0";
 
-// The NEP-141 interface this contract calls, and the self-callback.
 #[allow(dead_code)]
 #[ext_contract(ext_ft)]
 trait FungibleToken {
@@ -38,7 +35,7 @@ trait FungibleToken {
 #[allow(dead_code)]
 #[ext_contract(ext_self)]
 trait ExtSelf {
-    fn ft_resolve(&mut self, recipient: AccountId, amount: U128, seq: u64) -> bool;
+    fn ft_resolve(&mut self, recipient: AccountId, amount: U128, payment_id: String) -> bool;
 }
 
 /// Policy supplied at deploy time.
@@ -47,9 +44,13 @@ trait ExtSelf {
 pub struct PolicyInit {
     pub per_tx_cap: U128,
     pub window_cap: U128,
+    /// Rolling-window length in nanoseconds. **0 disables rolling** — the window
+    /// counter never resets, so `window_cap` acts as a lifetime cap.
     pub window_duration_ns: U64,
     pub total_cap: Option<U128>,
     pub allowlist_enabled: bool,
+    /// Optional unix-seconds expiry for the whole agent's `pay` authority.
+    pub expires_at_seconds: Option<u64>,
 }
 
 #[near(serializers = [json])]
@@ -60,6 +61,7 @@ pub struct PolicyView {
     pub window_duration_ns: U64,
     pub total_cap: Option<U128>,
     pub allowlist_enabled: bool,
+    pub expires_at_seconds: Option<u64>,
     pub paused: bool,
 }
 
@@ -101,13 +103,20 @@ pub struct PaymentAgent {
     window_duration_ns: u64,
     total_cap: Option<u128>,
     allowlist_enabled: bool,
+    /// Whole-agent expiry (unix seconds). Per-*key* expiry is not enforceable here:
+    /// in the meta-tx (relayed) flow the contract cannot identify which scoped key
+    /// signed, so expiry is per-agent. Use a separate agent per delegate for
+    /// independent expiries (cheap under the per-payer global-contract model).
+    policy_expires_at: Option<u64>,
     recipients: LookupSet<AccountId>,
+    /// Idempotency: payment_ids that have been committed (or are in-flight). A
+    /// failed transfer frees its id so the payment can be retried.
+    seen_payments: LookupSet<String>,
 
     // ---- accounting (reserve-then-commit; counters include in-flight reservations) ----
     window_start_ns: u64,
     window_spent: u128,
     total_spent: u128,
-    event_seq: u64,
 }
 
 #[near]
@@ -124,11 +133,12 @@ impl PaymentAgent {
             window_duration_ns: policy.window_duration_ns.0,
             total_cap: policy.total_cap.map(|c| c.0),
             allowlist_enabled: policy.allowlist_enabled,
+            policy_expires_at: policy.expires_at_seconds,
             recipients: LookupSet::new(b"r".to_vec()),
+            seen_payments: LookupSet::new(b"p".to_vec()),
             window_start_ns: env::block_timestamp(),
             window_spent: 0,
             total_spent: 0,
-            event_seq: 0,
         }
     }
 
@@ -137,16 +147,24 @@ impl PaymentAgent {
     // ---------------------------------------------------------------------
 
     /// Move `amount` of the pinned token to `recipient`, subject to policy.
+    /// `payment_id` is a caller-supplied idempotency key (deduplicated).
     ///
     /// Deliberately NOT `#[payable]`: near-sdk then asserts `attached_deposit == 0`,
     /// which is exactly what a function-call key attaches. The 1 yoctoNEAR NEP-141
     /// requires is attached by this contract to its own `ft_transfer` promise,
     /// funded from the agent account's balance — never from the calling key.
-    pub fn pay(&mut self, recipient: AccountId, amount: U128) -> Promise {
+    pub fn pay(&mut self, recipient: AccountId, amount: U128, payment_id: String) -> Promise {
         require!(!self.paused, "paused");
+        if let Some(expires_at) = self.policy_expires_at {
+            require!(now_seconds() < expires_at, "authority expired");
+        }
+        require!(
+            !self.seen_payments.contains(&payment_id),
+            "payment_id already used"
+        );
+
         let amt = amount.0;
         self.roll_window();
-
         require!(amt <= self.per_tx_cap, "amount exceeds per_tx_cap");
         if self.allowlist_enabled {
             require!(
@@ -167,45 +185,43 @@ impl PaymentAgent {
             require!(next_total <= cap, "total_cap exceeded");
         }
 
-        // RESERVE before transferring: NEAR interleaves receipts, so concurrent
-        // `pay` calls must each observe the decremented budget or a burst blows
-        // the cap. `ft_resolve` refunds on a failed transfer.
+        // RESERVE before transferring (NEAR interleaves receipts, so concurrent
+        // `pay`s must each observe the decremented budget). `ft_resolve` refunds
+        // on a failed transfer.
         self.window_spent = next_window;
         self.total_spent = next_total;
-        let seq = self.event_seq;
-        self.event_seq += 1;
+        self.seen_payments.insert(payment_id.clone());
 
         ext_ft::ext(self.token_id.clone())
             .with_attached_deposit(NearToken::from_yoctonear(1))
             .with_static_gas(GAS_FT_TRANSFER)
-            .ft_transfer(recipient.clone(), amount, None)
+            .ft_transfer(recipient.clone(), amount, Some(payment_id.clone()))
             .then(
                 ext_self::ext(env::current_account_id())
                     .with_static_gas(GAS_FT_RESOLVE)
-                    .ft_resolve(recipient, amount, seq),
+                    .ft_resolve(recipient, amount, payment_id),
             )
     }
 
-    /// Private callback: commit on success, refund the reservation on failure.
-    /// MUST stay `#[private]` — a forged external call has no promise result and
-    /// would read as a failure, refunding budget that was never spent.
+    /// Private callback: commit on success, refund the reservation and free the
+    /// `payment_id` on failure. MUST stay `#[private]` — a forged external call
+    /// has no promise result and would read as a failure, corrupting counters.
     #[private]
     pub fn ft_resolve(
         &mut self,
         recipient: AccountId,
         amount: U128,
-        seq: u64,
+        payment_id: String,
         #[callback_result] transfer: Result<(), PromiseError>,
     ) -> bool {
         if transfer.is_ok() {
-            self.emit("pay_succeeded", &recipient, amount, seq);
+            self.emit("pay_succeeded", &recipient, amount, &payment_id);
             true
         } else {
-            // Refund the reservation. saturating_sub is defensive; counters were
-            // reserved in `pay` so they cannot legitimately underflow.
             self.window_spent = self.window_spent.saturating_sub(amount.0);
             self.total_spent = self.total_spent.saturating_sub(amount.0);
-            self.emit("pay_refunded", &recipient, amount, seq);
+            self.seen_payments.remove(&payment_id); // failed -> retryable with the same id
+            self.emit("pay_refunded", &recipient, amount, &payment_id);
             false
         }
     }
@@ -256,6 +272,13 @@ impl PaymentAgent {
         self.window_cap = window_cap.0;
         self.window_duration_ns = window_duration_ns.0;
         self.total_cap = total_cap.map(|c| c.0);
+        self.config_version += 1;
+    }
+
+    #[payable]
+    pub fn set_expiry(&mut self, expires_at_seconds: Option<u64>) {
+        self.assert_owner();
+        self.policy_expires_at = expires_at_seconds;
         self.config_version += 1;
     }
 
@@ -337,12 +360,11 @@ impl PaymentAgent {
             window_duration_ns: U64(self.window_duration_ns),
             total_cap: self.total_cap.map(U128),
             allowlist_enabled: self.allowlist_enabled,
+            expires_at_seconds: self.policy_expires_at,
             paused: self.paused,
         }
     }
 
-    /// Facilitator preflight metadata. Only meaningful once the caller has
-    /// confirmed this account's code hash is an allowlisted build.
     pub fn x402_agent_metadata(&self) -> AgentMetadata {
         AgentMetadata {
             version: self.config_version,
@@ -364,6 +386,10 @@ impl PaymentAgent {
         }
     }
 
+    pub fn is_payment_seen(&self, payment_id: String) -> bool {
+        self.seen_payments.contains(&payment_id)
+    }
+
     // ---------------------------------------------------------------------
     // Internal
     // ---------------------------------------------------------------------
@@ -378,8 +404,12 @@ impl PaymentAgent {
         );
     }
 
-    /// Reset the rolling window if the current one has elapsed.
+    /// Reset the rolling window if it has elapsed. `window_duration_ns == 0`
+    /// disables rolling entirely (window_cap becomes a lifetime cap).
     fn roll_window(&mut self) {
+        if self.window_duration_ns == 0 {
+            return;
+        }
         let now = env::block_timestamp();
         if now.saturating_sub(self.window_start_ns) >= self.window_duration_ns {
             self.window_start_ns = now;
@@ -387,7 +417,7 @@ impl PaymentAgent {
         }
     }
 
-    fn emit(&self, event: &str, recipient: &AccountId, amount: U128, seq: u64) {
+    fn emit(&self, event: &str, recipient: &AccountId, amount: U128, payment_id: &str) {
         let json = near_sdk::serde_json::json!({
             "standard": EVENT_STANDARD,
             "version": EVENT_VERSION,
@@ -396,9 +426,231 @@ impl PaymentAgent {
                 "token_id": self.token_id,
                 "recipient": recipient,
                 "amount": amount,
-                "seq": seq,
+                "payment_id": payment_id,
             }],
         });
         env::log_str(&format!("EVENT_JSON:{}", json));
+    }
+}
+
+fn now_seconds() -> u64 {
+    env::block_timestamp_ms() / 1_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::testing_env;
+
+    fn acc(s: &str) -> AccountId {
+        s.parse().unwrap()
+    }
+
+    /// Context builder. `deposit_yocto` lets owner-method tests attach the 1 yocto
+    /// `assert_one_yocto` requires; `pay` tests use predecessor == the agent itself
+    /// (the self-call a delegate action produces) with deposit 0.
+    fn ctx(predecessor: &str, deposit_yocto: u128, ts_seconds: u64) -> VMContextBuilder {
+        let mut b = VMContextBuilder::new();
+        b.current_account_id(acc("agent.mike.testnet"))
+            .predecessor_account_id(acc(predecessor))
+            .signer_account_id(acc(predecessor))
+            .attached_deposit(NearToken::from_yoctonear(deposit_yocto))
+            .block_timestamp(ts_seconds * 1_000_000_000);
+        b
+    }
+
+    fn policy() -> PolicyInit {
+        PolicyInit {
+            per_tx_cap: U128(100),
+            window_cap: U128(200),
+            window_duration_ns: U64(0), // lifetime cap
+            total_cap: None,
+            allowlist_enabled: false,
+            expires_at_seconds: None,
+        }
+    }
+
+    fn new_contract() -> PaymentAgent {
+        testing_env!(ctx("owner.testnet", 0, 100).build());
+        PaymentAgent::new(acc("owner.testnet"), acc("usdc.testnet"), policy())
+    }
+
+    // predecessor == the agent account == a self-call, deposit 0 (what a scoped
+    // function-call key produces).
+    fn as_agent(ts: u64) {
+        testing_env!(ctx("agent.mike.testnet", 0, ts).build());
+    }
+    fn as_owner(ts: u64) {
+        testing_env!(ctx("owner.testnet", 1, ts).build());
+    }
+
+    #[test]
+    fn pay_reserves_and_records() {
+        let mut c = new_contract();
+        as_agent(101);
+        let _ = c.pay(acc("merchant.testnet"), U128(50), "pay-1".to_string());
+        assert_eq!(c.get_spend().window_spent.0, 50);
+        assert_eq!(c.get_spend().total_spent.0, 50);
+        assert!(c.is_payment_seen("pay-1".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "payment_id already used")]
+    fn pay_rejects_replay() {
+        let mut c = new_contract();
+        as_agent(101);
+        let _ = c.pay(acc("merchant.testnet"), U128(50), "dup".to_string());
+        let _ = c.pay(acc("merchant.testnet"), U128(10), "dup".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "amount exceeds per_tx_cap")]
+    fn pay_rejects_over_per_tx_cap() {
+        let mut c = new_contract();
+        as_agent(101);
+        let _ = c.pay(acc("merchant.testnet"), U128(101), "x".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "window_cap exceeded")]
+    fn pay_rejects_over_window_cap() {
+        let mut c = new_contract();
+        as_agent(101);
+        let _ = c.pay(acc("m.testnet"), U128(100), "a".to_string()); // 100
+        let _ = c.pay(acc("m.testnet"), U128(100), "b".to_string()); // 200 == cap, ok
+        let _ = c.pay(acc("m.testnet"), U128(1), "c".to_string()); // 201 > cap
+    }
+
+    #[test]
+    #[should_panic(expected = "total_cap exceeded")]
+    fn pay_rejects_over_total_cap() {
+        testing_env!(ctx("owner.testnet", 0, 100).build());
+        let mut p = policy();
+        p.total_cap = Some(U128(120));
+        p.window_duration_ns = U64(1_000_000_000); // rolling, so window won't bind first
+        let mut c = PaymentAgent::new(acc("owner.testnet"), acc("usdc.testnet"), p);
+        as_agent(101);
+        let _ = c.pay(acc("m.testnet"), U128(100), "a".to_string()); // total 100
+        as_agent(103); // new window
+        let _ = c.pay(acc("m.testnet"), U128(100), "b".to_string()); // total 200 > 120
+    }
+
+    #[test]
+    #[should_panic(expected = "paused")]
+    fn pay_rejects_when_paused() {
+        let mut c = new_contract();
+        as_owner(101);
+        c.set_paused(true);
+        as_agent(102);
+        let _ = c.pay(acc("m.testnet"), U128(1), "p".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "authority expired")]
+    fn pay_rejects_after_expiry() {
+        let mut c = new_contract();
+        as_owner(101);
+        c.set_expiry(Some(200));
+        as_agent(201);
+        let _ = c.pay(acc("m.testnet"), U128(1), "e".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "recipient not allowlisted")]
+    fn pay_rejects_non_allowlisted() {
+        let mut c = new_contract();
+        as_owner(101);
+        c.set_allowlist_enabled(true);
+        as_agent(102);
+        let _ = c.pay(acc("stranger.testnet"), U128(1), "n".to_string());
+    }
+
+    #[test]
+    fn pay_allows_allowlisted_recipient() {
+        let mut c = new_contract();
+        as_owner(101);
+        c.set_allowlist_enabled(true);
+        as_owner(101);
+        c.add_recipient(acc("merchant.testnet"));
+        as_agent(102);
+        let _ = c.pay(acc("merchant.testnet"), U128(10), "ok".to_string());
+        assert_eq!(c.get_spend().window_spent.0, 10);
+    }
+
+    #[test]
+    fn resolve_success_commits() {
+        let mut c = new_contract();
+        as_agent(101);
+        let _ = c.pay(acc("m.testnet"), U128(50), "s".to_string());
+        as_agent(102);
+        let kept = c.ft_resolve(acc("m.testnet"), U128(50), "s".to_string(), Ok(()));
+        assert!(kept);
+        assert_eq!(c.get_spend().window_spent.0, 50);
+        assert!(c.is_payment_seen("s".to_string()));
+    }
+
+    #[test]
+    fn resolve_failure_refunds_and_frees_payment_id() {
+        let mut c = new_contract();
+        as_agent(101);
+        let _ = c.pay(acc("m.testnet"), U128(50), "f".to_string());
+        assert_eq!(c.get_spend().window_spent.0, 50);
+        as_agent(102);
+        let kept = c.ft_resolve(
+            acc("m.testnet"),
+            U128(50),
+            "f".to_string(),
+            Err(PromiseError::Failed),
+        );
+        assert!(!kept);
+        assert_eq!(c.get_spend().window_spent.0, 0);
+        assert_eq!(c.get_spend().total_spent.0, 0);
+        assert!(!c.is_payment_seen("f".to_string()));
+        // retryable with the same id
+        as_agent(103);
+        let _ = c.pay(acc("m.testnet"), U128(50), "f".to_string());
+        assert_eq!(c.get_spend().window_spent.0, 50);
+    }
+
+    #[test]
+    fn window_rolls_after_duration() {
+        testing_env!(ctx("owner.testnet", 0, 100).build());
+        let mut p = policy();
+        p.window_duration_ns = U64(1_000_000_000); // 1s
+        let mut c = PaymentAgent::new(acc("owner.testnet"), acc("usdc.testnet"), p);
+        as_agent(100);
+        let _ = c.pay(acc("m.testnet"), U128(100), "w1".to_string());
+        assert_eq!(c.get_spend().window_spent.0, 100);
+        as_agent(102); // > 1s later -> window resets, then +100
+        let _ = c.pay(acc("m.testnet"), U128(100), "w2".to_string());
+        assert_eq!(c.get_spend().window_spent.0, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "owner only")]
+    fn non_owner_cannot_set_limits() {
+        let mut c = new_contract();
+        testing_env!(ctx("attacker.testnet", 1, 101).build());
+        c.set_limits(U128(1), U128(1), U64(0), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "1 yoctoNEAR")]
+    fn owner_method_requires_one_yocto() {
+        let mut c = new_contract();
+        testing_env!(ctx("owner.testnet", 0, 101).build()); // no yocto
+        c.set_paused(true);
+    }
+
+    #[test]
+    fn owner_can_update_policy() {
+        let mut c = new_contract();
+        as_owner(101);
+        c.set_limits(U128(5), U128(9), U64(0), Some(U128(50)));
+        let p = c.get_policy();
+        assert_eq!(p.per_tx_cap.0, 5);
+        assert_eq!(p.window_cap.0, 9);
+        assert_eq!(p.total_cap.unwrap().0, 50);
     }
 }
