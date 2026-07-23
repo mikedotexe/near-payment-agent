@@ -4,6 +4,9 @@
 # cargo-near artifacts
 *.wasm
 
+# Node deps (the TS demo under demo/)
+node_modules/
+
 # Editor/OS cruft
 .DS_Store
 

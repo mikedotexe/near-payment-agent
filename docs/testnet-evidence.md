@@ -65,6 +65,26 @@ key cannot attach.
 permission above; near-cli refuses to broadcast them, so they carry no tx hash —
 the `view_access_key` permission is their proof.)
 
+## Relayed settlement — the full x402 meta-tx path (2026-07-23)
+
+The proof above has the function-call key pay its own gas. The **relayed** path is the
+actual x402 shape: the scoped key only *authorizes*, and a **relayer sponsors the gas**
+via a NEP-366 meta-transaction. Demonstrated on testnet
+([`demo/relayed-agent-pay`](../demo/relayed-agent-pay)):
+
+- the scoped key `ed25519:7deeaRuc…` signed a `pay()` SignedDelegate;
+- a relayer, `relay839619.mike.testnet`, wrapped it in `Action::Delegate` and broadcast
+  it — the **outer tx signer is the relayer**, whose balance dropped by the gas
+  (~0.00068 Ⓝ); the custodian paid nothing;
+- the agent's `pay` attached the 1 yocto itself and moved 500 to the merchant
+  (1000 → 1500); the inner NEP-141 `ft_transfer` receipt (executor = token) succeeded.
+
+Tx [`C5KaUwv8E7tuPegHZQFPLpQsU5WHnuJvhG27cyFgZadb`](https://testnet.nearblocks.io/txns/C5KaUwv8E7tuPegHZQFPLpQsU5WHnuJvhG27cyFgZadb).
+This resolves the open "who pays gas" question: in the relayed delegate the **relayer**
+pays and the function-call key's allowance is not charged — the full custodial flow (no
+full-access key, no gas from the payer) settled through a standard meta-transaction,
+which is exactly what the `exact` scheme cannot do.
+
 ## Honest scope
 
 - The token is a **mock NEP-141**. The mechanism proven here — function-call-key
@@ -72,8 +92,9 @@ the `view_access_key` permission is their proof.)
   rejections — is **token-agnostic**: it is identical against real USDC or
   `wrap.testnet`. A real-token run adds no new information about the authority model
   and is a straightforward follow-up.
-- This proves the **direct** function-call-key path. The **relayed** path (a
-  facilitator sponsoring gas via a NEP-366 meta-transaction under the `exact-agent`
-  x402 scheme) is Phase 3.
+- Both the **direct** and the **relayed** (relayer-sponsored, NEP-366 meta-tx)
+  function-call-key paths are now proven on testnet — the relayed one is the section
+  above. What remains is packaging the client + reference relay as a first-class
+  `@x402/near-agent` scheme for the x402 Foundation.
 - Contract logic (policy, reserve-then-commit, refund) is covered separately by the
   15 near-sdk unit tests in `src/lib.rs`.

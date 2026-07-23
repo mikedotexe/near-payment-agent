@@ -1,0 +1,13 @@
+{
+  "name": "relayed-agent-pay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 3 demo: relayed (NEP-366 meta-tx) exact-agent settlement — a relayer sponsors gas while a scoped function-call key authorizes pay().",
+  "dependencies": {
+    "near-api-js": "^5.0.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}
