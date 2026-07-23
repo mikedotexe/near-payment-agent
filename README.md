@@ -33,11 +33,13 @@ This contract closes that gap in userspace, with no protocol change:
 
 ## Status
 
-**Phase 0 — design + compiling skeleton.** The interface in `src/lib.rs` compiles
-(`cargo check --target wasm32-unknown-unknown`); method bodies are `todo!()`. No
-funds, no deployment. Payment / policy / callback logic lands in Phase 1+. The
-phased plan lives in `docs/design.md` and the coordination hub (near-integrations
-Program 04).
+**Phase 1 — MVP proven.** Contract logic is covered by 15 near-sdk unit tests, and
+the least-privilege thesis is **demonstrated on NEAR testnet**: a `pay`-scoped
+function-call key settled a payment and was rejected on-chain doing anything else
+(method / receiver / deposit). See [`docs/testnet-evidence.md`](docs/testnet-evidence.md),
+reproducible via [`scripts/testnet-proof.sh`](scripts/testnet-proof.sh). Next: the
+`exact-agent` x402 scheme (relayer-sponsored settlement). Phased plan in
+[`docs/design.md`](docs/design.md).
 
 ## Build & test
 
