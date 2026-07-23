@@ -1,0 +1,6 @@
+# Recent rustc emits `bulk-memory` and `sign-ext` wasm ops by default for
+# wasm32-unknown-unknown, which NEAR's on-chain wasm validator (and cargo-near's
+# build-time validation) reject. Disable them so the produced wasm validates and
+# deploys on NEAR.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=-bulk-memory,-sign-ext"]

@@ -1,0 +1,13 @@
+[package]
+name = "mock-ft"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+publish = false
+description = "Minimal NEP-141 used only as a test fixture for near-payment-agent."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "5"

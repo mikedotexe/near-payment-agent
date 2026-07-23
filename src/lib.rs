@@ -12,29 +12,43 @@
 //! by [`near_sdk::assert_one_yocto`], which a function-call key structurally
 //! cannot satisfy, so a scoped key can reach `pay` and nothing else.
 //!
-//! PHASE 0 — interface skeleton only. Method bodies are `todo!()`; the payment,
-//! policy, reserve-then-commit accounting, and callback logic land in Phase 1+.
 //! See `docs/design.md` and `docs/threat-model.md`.
 
 use near_sdk::json_types::{U128, U64};
 use near_sdk::store::LookupSet;
 use near_sdk::{
-    assert_one_yocto, env, near, require, AccountId, PanicOnDefault, Promise, PublicKey,
+    assert_one_yocto, env, ext_contract, near, require, AccountId, Allowance, Gas, NearToken,
+    PanicOnDefault, Promise, PromiseError, PublicKey,
 };
+
+/// Static gas for the spawned `ft_transfer` and the resolve callback.
+const GAS_FT_TRANSFER: Gas = Gas::from_tgas(15);
+const GAS_FT_RESOLVE: Gas = Gas::from_tgas(10);
+
+const EVENT_STANDARD: &str = "payment_agent";
+const EVENT_VERSION: &str = "1.0.0";
+
+// The NEP-141 interface this contract calls, and the self-callback.
+#[allow(dead_code)]
+#[ext_contract(ext_ft)]
+trait FungibleToken {
+    fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>);
+}
+
+#[allow(dead_code)]
+#[ext_contract(ext_self)]
+trait ExtSelf {
+    fn ft_resolve(&mut self, recipient: AccountId, amount: U128, seq: u64) -> bool;
+}
 
 /// Policy supplied at deploy time.
 #[near(serializers = [json])]
 #[derive(Clone)]
 pub struct PolicyInit {
-    /// Maximum per-`pay` amount, atomic token units.
     pub per_tx_cap: U128,
-    /// Maximum cumulative spend within one rolling window.
     pub window_cap: U128,
-    /// Rolling-window duration, nanoseconds.
     pub window_duration_ns: U64,
-    /// Optional lifetime spend ceiling.
     pub total_cap: Option<U128>,
-    /// When true, `pay` recipients must be on the on-chain allowlist.
     pub allowlist_enabled: bool,
 }
 
@@ -76,14 +90,9 @@ pub struct SimResult {
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct PaymentAgent {
-    /// Full-access controller: the only principal that can change policy, manage
-    /// keys, withdraw, or delete the account.
     owner_id: AccountId,
-    /// The single NEP-141 token this agent may move.
     token_id: AccountId,
-    /// Kill switch, checked at the top of `pay` (halts even in-flight delegates).
     paused: bool,
-    /// Bumped on policy/config change; pairs with the code hash for attestation.
     config_version: u16,
 
     // ---- policy ----
@@ -105,8 +114,22 @@ pub struct PaymentAgent {
 impl PaymentAgent {
     #[init]
     pub fn new(owner_id: AccountId, token_id: AccountId, policy: PolicyInit) -> Self {
-        let _ = (owner_id, token_id, policy);
-        todo!("Phase 1: initialize state, recipients LookupSet, and the first window")
+        Self {
+            owner_id,
+            token_id,
+            paused: false,
+            config_version: 1,
+            per_tx_cap: policy.per_tx_cap.0,
+            window_cap: policy.window_cap.0,
+            window_duration_ns: policy.window_duration_ns.0,
+            total_cap: policy.total_cap.map(|c| c.0),
+            allowlist_enabled: policy.allowlist_enabled,
+            recipients: LookupSet::new(b"r".to_vec()),
+            window_start_ns: env::block_timestamp(),
+            window_spent: 0,
+            total_spent: 0,
+            event_seq: 0,
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -120,35 +143,100 @@ impl PaymentAgent {
     /// requires is attached by this contract to its own `ft_transfer` promise,
     /// funded from the agent account's balance — never from the calling key.
     pub fn pay(&mut self, recipient: AccountId, amount: U128) -> Promise {
-        let _ = (recipient, amount);
-        todo!("Phase 1: policy checks -> reserve budget -> ft_transfer{{1yocto}}.then(ft_resolve)")
+        require!(!self.paused, "paused");
+        let amt = amount.0;
+        self.roll_window();
+
+        require!(amt <= self.per_tx_cap, "amount exceeds per_tx_cap");
+        if self.allowlist_enabled {
+            require!(
+                self.recipients.contains(&recipient),
+                "recipient not allowlisted"
+            );
+        }
+        let next_window = self
+            .window_spent
+            .checked_add(amt)
+            .expect("window counter overflow");
+        require!(next_window <= self.window_cap, "window_cap exceeded");
+        let next_total = self
+            .total_spent
+            .checked_add(amt)
+            .expect("total counter overflow");
+        if let Some(cap) = self.total_cap {
+            require!(next_total <= cap, "total_cap exceeded");
+        }
+
+        // RESERVE before transferring: NEAR interleaves receipts, so concurrent
+        // `pay` calls must each observe the decremented budget or a burst blows
+        // the cap. `ft_resolve` refunds on a failed transfer.
+        self.window_spent = next_window;
+        self.total_spent = next_total;
+        let seq = self.event_seq;
+        self.event_seq += 1;
+
+        ext_ft::ext(self.token_id.clone())
+            .with_attached_deposit(NearToken::from_yoctonear(1))
+            .with_static_gas(GAS_FT_TRANSFER)
+            .ft_transfer(recipient.clone(), amount, None)
+            .then(
+                ext_self::ext(env::current_account_id())
+                    .with_static_gas(GAS_FT_RESOLVE)
+                    .ft_resolve(recipient, amount, seq),
+            )
     }
 
     /// Private callback: commit on success, refund the reservation on failure.
     /// MUST stay `#[private]` — a forged external call has no promise result and
     /// would read as a failure, refunding budget that was never spent.
     #[private]
-    pub fn ft_resolve(&mut self, recipient: AccountId, amount: U128, seq: u64) -> bool {
-        let _ = (recipient, amount, seq);
-        todo!("Phase 1: interpret promise result; refund window/total counters on failure")
+    pub fn ft_resolve(
+        &mut self,
+        recipient: AccountId,
+        amount: U128,
+        seq: u64,
+        #[callback_result] transfer: Result<(), PromiseError>,
+    ) -> bool {
+        if transfer.is_ok() {
+            self.emit("pay_succeeded", &recipient, amount, seq);
+            true
+        } else {
+            // Refund the reservation. saturating_sub is defensive; counters were
+            // reserved in `pay` so they cannot legitimately underflow.
+            self.window_spent = self.window_spent.saturating_sub(amount.0);
+            self.total_spent = self.total_spent.saturating_sub(amount.0);
+            self.emit("pay_refunded", &recipient, amount, seq);
+            false
+        }
     }
 
     // ---------------------------------------------------------------------
     // Owner: scoped-key management (assert_one_yocto ⇒ full-access key only)
     // ---------------------------------------------------------------------
 
+    /// Add a function-call access key scoped to `pay` on this account. `allowance`
+    /// is the gas budget in yoctoNEAR (NOT a token cap — token limits are policy).
     #[payable]
     pub fn add_agent_key(&mut self, public_key: PublicKey, allowance: Option<U128>) -> Promise {
         self.assert_owner();
-        let _ = (public_key, allowance);
-        todo!("Phase 2: AddKey with a FunctionCall permission scoped to method `pay` on self")
+        let allowance = match allowance {
+            Some(a) => {
+                Allowance::limited(NearToken::from_yoctonear(a.0)).expect("allowance must be > 0")
+            }
+            None => Allowance::unlimited(),
+        };
+        Promise::new(env::current_account_id()).add_access_key_allowance(
+            public_key,
+            allowance,
+            env::current_account_id(),
+            "pay".to_string(),
+        )
     }
 
     #[payable]
     pub fn revoke_agent_key(&mut self, public_key: PublicKey) -> Promise {
         self.assert_owner();
-        let _ = public_key;
-        todo!("Phase 2: DeleteKey")
+        Promise::new(env::current_account_id()).delete_key(public_key)
     }
 
     // ---------------------------------------------------------------------
@@ -164,29 +252,30 @@ impl PaymentAgent {
         total_cap: Option<U128>,
     ) {
         self.assert_owner();
-        let _ = (per_tx_cap, window_cap, window_duration_ns, total_cap);
-        todo!("Phase 2")
+        self.per_tx_cap = per_tx_cap.0;
+        self.window_cap = window_cap.0;
+        self.window_duration_ns = window_duration_ns.0;
+        self.total_cap = total_cap.map(|c| c.0);
+        self.config_version += 1;
     }
 
     #[payable]
     pub fn set_allowlist_enabled(&mut self, enabled: bool) {
         self.assert_owner();
-        let _ = enabled;
-        todo!("Phase 2")
+        self.allowlist_enabled = enabled;
+        self.config_version += 1;
     }
 
     #[payable]
     pub fn add_recipient(&mut self, recipient: AccountId) {
         self.assert_owner();
-        let _ = recipient;
-        todo!("Phase 2")
+        self.recipients.insert(recipient);
     }
 
     #[payable]
     pub fn remove_recipient(&mut self, recipient: AccountId) {
         self.assert_owner();
-        let _ = recipient;
-        todo!("Phase 2")
+        self.recipients.remove(&recipient);
     }
 
     /// Immediate stop. Checked inside `pay`, so it halts even already-signed,
@@ -205,8 +294,29 @@ impl PaymentAgent {
     }
 
     // ---------------------------------------------------------------------
-    // Owner: NEP-145 storage + funds
+    // Owner: funds (storage registration + simulate_pay land in Phase 2)
     // ---------------------------------------------------------------------
+
+    #[payable]
+    pub fn withdraw(&mut self, to: AccountId, amount: U128) -> Promise {
+        self.assert_owner();
+        ext_ft::ext(self.token_id.clone())
+            .with_attached_deposit(NearToken::from_yoctonear(1))
+            .with_static_gas(GAS_FT_TRANSFER)
+            .ft_transfer(to, amount, None)
+    }
+
+    #[payable]
+    pub fn withdraw_near(&mut self, to: AccountId, amount: U128) -> Promise {
+        self.assert_owner();
+        Promise::new(to).transfer(NearToken::from_yoctonear(amount.0))
+    }
+
+    #[payable]
+    pub fn close_account(&mut self, beneficiary: AccountId) -> Promise {
+        self.assert_owner();
+        Promise::new(env::current_account_id()).delete_account(beneficiary)
+    }
 
     #[payable]
     pub fn storage_register_self(&mut self, deposit: U128) -> Promise {
@@ -215,33 +325,20 @@ impl PaymentAgent {
         todo!("Phase 2: storage_deposit on the token contract for this account")
     }
 
-    #[payable]
-    pub fn withdraw(&mut self, to: AccountId, amount: U128) -> Promise {
-        self.assert_owner();
-        let _ = (to, amount);
-        todo!("Phase 2: owner-controlled ft_transfer out")
-    }
-
-    #[payable]
-    pub fn withdraw_near(&mut self, to: AccountId, amount: U128) -> Promise {
-        self.assert_owner();
-        let _ = (to, amount);
-        todo!("Phase 2: reclaim excess NEAR")
-    }
-
-    #[payable]
-    pub fn close_account(&mut self, beneficiary: AccountId) -> Promise {
-        self.assert_owner();
-        let _ = beneficiary;
-        todo!("Phase 2: DeleteAccount, remaining balance to beneficiary")
-    }
-
     // ---------------------------------------------------------------------
     // Views
     // ---------------------------------------------------------------------
 
     pub fn get_policy(&self) -> PolicyView {
-        todo!("Phase 1")
+        PolicyView {
+            token_id: self.token_id.clone(),
+            per_tx_cap: U128(self.per_tx_cap),
+            window_cap: U128(self.window_cap),
+            window_duration_ns: U64(self.window_duration_ns),
+            total_cap: self.total_cap.map(U128),
+            allowlist_enabled: self.allowlist_enabled,
+            paused: self.paused,
+        }
     }
 
     /// Facilitator preflight metadata. Only meaningful once the caller has
@@ -254,8 +351,6 @@ impl PaymentAgent {
         }
     }
 
-    /// Gasless policy preflight — lets a facilitator reject a doomed `pay`
-    /// without sponsoring gas on it.
     pub fn simulate_pay(&self, recipient: AccountId, amount: U128) -> SimResult {
         let _ = (recipient, amount);
         todo!("Phase 2")
@@ -281,5 +376,29 @@ impl PaymentAgent {
             env::predecessor_account_id() == self.owner_id,
             "owner only"
         );
+    }
+
+    /// Reset the rolling window if the current one has elapsed.
+    fn roll_window(&mut self) {
+        let now = env::block_timestamp();
+        if now.saturating_sub(self.window_start_ns) >= self.window_duration_ns {
+            self.window_start_ns = now;
+            self.window_spent = 0;
+        }
+    }
+
+    fn emit(&self, event: &str, recipient: &AccountId, amount: U128, seq: u64) {
+        let json = near_sdk::serde_json::json!({
+            "standard": EVENT_STANDARD,
+            "version": EVENT_VERSION,
+            "event": event,
+            "data": [{
+                "token_id": self.token_id,
+                "recipient": recipient,
+                "amount": amount,
+                "seq": seq,
+            }],
+        });
+        env::log_str(&format!("EVENT_JSON:{}", json));
     }
 }

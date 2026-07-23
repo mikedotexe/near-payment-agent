@@ -142,3 +142,66 @@ key (and the owner).
   small-value mainnet proof; record evidence in the hub (Program 04).
 - **Phase 5 — harden**: audit; global-contract-by-hash; deployment guide; the
   userland artifact backing the parked `near/NEPs` least-privilege ask.
+
+## Roadmap — beyond the MVP
+
+The MVP proves the *primitive*. Four moves, in leverage order, turn it into
+infrastructure and a category. (A trajectory, not a commitment — each is a
+hypothesis to pressure-test as we go.)
+
+1. **Close the loop — a real custodian settling `pay()` with a function-call key.**
+   The `exact-agent` scheme (Phase 3) + a facilitator that speaks it + the Circle
+   signer building a `pay()` delegate. When this lands on mainnet the program's
+   thesis is realized: Circle holds a function-call key, not a full-access key.
+   Highest leverage; everything else compounds on it.
+2. **From a contract to infrastructure — trust at scale.** Global-contract-by-hash
+   (one attested hash for every payer) + reproducible build + audit, then a shared
+   on-chain registry of blessed hashes so *any* facilitator can trustlessly accept
+   *any* payer's agent. The line between "an integration" and "a rail".
+3. **A policy engine for agents.** Beyond caps + allowlist: multiple scoped keys as
+   independent sub-budgets (a fleet of agents under one treasury); streaming/rate
+   allowances, per-recipient limits, expiry; a co-sign threshold for large amounts;
+   an auditable spend ledger (events → history). Much of this vocabulary already
+   exists and is battle-tested — see below.
+4. **A standard + a protocol ask.** The `exact-agent` scheme → the x402 Foundation
+   (non-EVM least-privilege payments, where Circle holds a board seat). The working
+   contract → the reference implementation backing the `near/NEPs` least-privilege
+   ask, turning it from a request into a demonstration.
+
+## Relationship to `x402-service-allowance` (Agent Fuel)
+
+Pressure-testing the "unify them" hypothesis against the existing, testnet-proven
+`x402-service-allowance-contract` (`~/near/fn/x402-subscriptions/contract`): they are
+**two distinct architectures on the custody ↔ least-privilege spectrum, not base +
+policy-profile.** Both bound a delegate's spend; they differ in three load-bearing
+choices:
+
+| | service-allowance (Agent Fuel) | payment-agent (this) |
+|---|---|---|
+| Custody | Funds pooled **in the contract** vault (custody transfer, multi-tenant) — the shared-ledger property, accepted for richness | Funds stay in the **payer's own account** (no transfer, per-payer) |
+| Delegate auth | `predecessor == delegate_id` — the agent is a **named account** calling `spend` | a **function-call key** scoped to `pay` on the payer account |
+| Settlement | Internal **earnings ledger**, seller withdraws later (deferred); built-in fee split | Direct NEP-141 `ft_transfer` to the merchant per payment (immediate) |
+| Policy maturity | **Higher** — registered services/prices, multi-service allowlist, expiry, per-request cap, `payment_id` replay guard, fee accounting, ~24 unit tests | Basic — per-tx/window/total caps, allowlist, pause |
+
+**Verdict:** do not merge them into one contract. They are complementary members of a
+**scheme family**: service-allowance is the *custodial payment-platform* option (rich,
+multi-tenant, fee-split, deferred); payment-agent is the *non-custodial least-privilege*
+option (sovereign, direct, per-payer). Offering both — letting a user pick their
+custody/feature tradeoff — is itself the story. The real convergence is two-fold:
+
+- **A shared policy vocabulary** (delegate, remaining, per-request cap, expiry,
+  allowlist, revocation, reserve-then-commit, replay-id, refund-on-fail). payment-agent
+  should adopt service-allowance's more mature pieces — a `payment_id` replay guard and
+  per-key expiry — in Phase 2.
+- **The x402 scheme layer.** service-allowance already *is* a non-EVM x402 payment
+  mechanism, and the existing `x402-near-facilitator` speaks it — so the facilitator that
+  would settle `exact-agent` largely already exists. Unify at the **scheme family +
+  facilitator**, not the contract.
+
+**Immediate borrow (unblocks testing):** service-allowance proves its policy, accounting,
+and callback-refund logic with **fast near-sdk unit tests** (`VMContextBuilder` +
+`testing_env!` + `testing_env_with_promise_results`) — no near-workspaces sandbox.
+payment-agent should do the same: unit-test all policy / reserve-then-commit / refund
+logic that way, and reserve near-workspaces solely for the access-key least-privilege
+proofs (the CANNOTs that need a real runtime). That sidesteps the 41-minute sandbox path
+for the bulk of the suite.
