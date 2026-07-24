@@ -12,7 +12,8 @@ import { homedir } from "node:os";
 import { connect, keyStores, KeyPair, transactions } from "near-api-js";
 
 const NET = "testnet";
-const NODE = "https://rpc.testnet.near.org";
+// rpc.testnet.near.org is deprecated and rate-limits (-429); default to FastNEAR.
+const NODE = process.env.NODE_URL ?? "https://rpc.testnet.fastnear.com";
 const CREDS = `${homedir()}/.near-credentials/${NET}`;
 
 const AGENT = must("AGENT");

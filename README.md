@@ -33,13 +33,17 @@ This contract closes that gap in userspace, with no protocol change:
 
 ## Status
 
-**Phase 1 — MVP proven.** Contract logic is covered by 15 near-sdk unit tests, and
-the least-privilege thesis is **demonstrated on NEAR testnet**: a `pay`-scoped
-function-call key settled a payment and was rejected on-chain doing anything else
-(method / receiver / deposit). See [`docs/testnet-evidence.md`](docs/testnet-evidence.md),
-reproducible via [`scripts/testnet-proof.sh`](scripts/testnet-proof.sh). Next: the
-`exact-agent` x402 scheme (relayer-sponsored settlement). Phased plan in
-[`docs/design.md`](docs/design.md).
+**Direct + relayed paths proven on NEAR testnet, including against real tokens.**
+Contract logic is covered by 15 near-sdk unit tests. A `pay`-scoped function-call
+key settled payments and was rejected on-chain doing anything else (method /
+receiver / deposit) — first against a mock NEP-141, then re-proven against
+**Circle-issued testnet USDC** (direct + relayed NEP-366 meta-tx, where a relayer
+sponsored the gas) and **wrap.testnet**. See
+[`docs/testnet-evidence.md`](docs/testnet-evidence.md), reproducible via
+[`scripts/testnet-proof.sh`](scripts/testnet-proof.sh) (mock) and
+[`scripts/testnet-proof-real-token.sh`](scripts/testnet-proof-real-token.sh) (any
+existing NEP-141). Next: packaging the client + reference relay as a first-class
+`@x402/near-agent` scheme. Phased plan in [`docs/design.md`](docs/design.md).
 
 ## Build & test
 

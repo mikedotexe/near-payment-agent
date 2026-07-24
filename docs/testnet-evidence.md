@@ -85,16 +85,66 @@ pays and the function-call key's allowance is not charged — the full custodial
 full-access key, no gas from the payer) settled through a standard meta-transaction,
 which is exactly what the `exact` scheme cannot do.
 
+## Real-token runs — Circle testnet USDC and wrap.testnet (2026-07-23)
+
+The proofs above used a mock NEP-141. The same mechanism was then re-proven against
+**two real, third-party tokens** — the token-agnostic claim is now evidence, not
+assertion. Reproduce with
+[`scripts/testnet-proof-real-token.sh`](../scripts/testnet-proof-real-token.sh),
+which points a fresh agent at any existing NEP-141 instead of deploying a mock.
+
+### Circle testnet USDC (`3e2210e1…cb8af`, 6 decimals)
+
+Agent `ag854443.mike.testnet`, merchant `shop854443.mike.testnet`, scoped key
+`ed25519:7fthtnLK8gQNrkqcDsR1EF3VF3QWvQwdXWqA686oXarn` — on-chain permission
+`FunctionCall{receiver_id: ag854443…, method_names: ["pay"]}` — funded with 1000
+atomic units of the Circle-issued test USDC.
+
+| Step | Tx |
+|---|---|
+| deploy payment-agent (`token_id` = USDC) | `FbiNGjYoKFHzqBQe5w1Pqier41i4GyxQC1AwPqhpgSHM` |
+| NEP-145 register agent + merchant | `4cr2bYEziyNvMkfYXEJxYKPCAad2KtJuNTgvX9PNz3bK`, `E9ChYJs87Z8HKLcdYy7ZPqYfgFFaRwYprVeBZRYFd4ez` |
+| fund agent (1000 from `merchant.mike.testnet`) | `E6mHUD6wmVJaN4fBwbC9QJD3FywQq64PgEu7uTFsmDc2` |
+| add scoped `pay` key | `EVvwsCCKZM73eMxDjMVvEFqCPvZgqCaLr8HDu2Rhimv1` |
+| **CAN: direct `pay` of 300 by the scoped key** | **[`2BaCYpkzcmmTwc4jDL9yXveL9FrMnpuBQjF1A36JmBCC`](https://testnet.nearblocks.io/txns/2BaCYpkzcmmTwc4jDL9yXveL9FrMnpuBQjF1A36JmBCC)** |
+| **CAN: relayed `pay` of 200 (NEP-366 meta-tx)** | **[`1E1QCSnxc7kW8dFVejUXZuyvCoeQ1oCr9riVL2kVD1p`](https://testnet.nearblocks.io/txns/1E1QCSnxc7kW8dFVejUXZuyvCoeQ1oCr9riVL2kVD1p)** |
+
+Direct: the **real USDC contract** emitted `ft_transfer {amount:"300"}` and the agent
+emitted `pay_succeeded`; merchant 0 → 300, agent 1000 → 700. Relayed: outer tx signer
+`relay839619.mike.testnet` (the relayer paid the gas), merchant 300 → 500, and the
+inner `ft_transfer` receipt was executed by the USDC contract with `SuccessValue` —
+the full x402 meta-tx shape settling Circle-issued USDC. The same scoped key was
+rejected on `withdraw` (`MethodNameMismatch`), on calling USDC directly
+(`ak_receiver: ag854443…` ≠ `tx_receiver: 3e2210e1…`), and on attaching a deposit to
+`pay` (`DepositWithFunctionCall`).
+
+### wrap.testnet (wNEAR, 24 decimals)
+
+Agent `ag854950.mike.testnet`, merchant `shop854950.mike.testnet`. Wrapped 0.02 Ⓝ
+(`near_deposit`, tx `EXorUNqzYm8CEsQdSWGu5hnQM5Pk6FaKPDjW3H9VeTmt`), funded the agent
+0.01 wNEAR (`3XrCmc5NxySJE4ZPUQd29zoUFEnapjn1smvcUSePzjpJ`), and the scoped key
+settled a direct `pay` of 0.003 wNEAR —
+[`9Wq5AEumEi2N4giYKxR13RriPBzTLt4Y9hq6Hd7x9MF6`](https://testnet.nearblocks.io/txns/9Wq5AEumEi2N4giYKxR13RriPBzTLt4Y9hq6Hd7x9MF6)
+(merchant 3×10²¹, agent 7×10²¹ yocto-wNEAR). All three CANNOT rejections reproduced
+identically (`MethodNameMismatch` / `ak_receiver` ≠ `tx_receiver: wrap.testnet` /
+`DepositWithFunctionCall`).
+
+As in the mock run, the method- and receiver-scope rejections are enforced from the
+on-chain key permission (near-cli refuses to broadcast them); `DepositWithFunctionCall`
+is the node's own rejection. Operational note: `rpc.testnet.near.org` is deprecated
+and rate-limits (-429) — the script and demo now default to
+`rpc.testnet.fastnear.com` (override via `NEAR_TESTNET_RPC` / `NODE_URL`).
+
 ## Honest scope
 
-- The token is a **mock NEP-141**. The mechanism proven here — function-call-key
-  scoping, the contract attaching the yocto, and the method/receiver/deposit
-  rejections — is **token-agnostic**: it is identical against real USDC or
-  `wrap.testnet`. A real-token run adds no new information about the authority model
-  and is a straightforward follow-up.
+- The mechanism is proven against the **mock** NEP-141 (above) and against **two real
+  tokens** — Circle-issued testnet USDC and `wrap.testnet` — with identical behavior:
+  function-call-key scoping, the contract attaching the yocto, and the
+  method/receiver/deposit rejections. Real-token evidence closes the mock-only
+  caveat; mainnet remains unexercised for this contract.
 - Both the **direct** and the **relayed** (relayer-sponsored, NEP-366 meta-tx)
-  function-call-key paths are now proven on testnet — the relayed one is the section
-  above. What remains is packaging the client + reference relay as a first-class
+  function-call-key paths are proven on testnet — relayed on both the mock and real
+  USDC. What remains is packaging the client + reference relay as a first-class
   `@x402/near-agent` scheme for the x402 Foundation.
 - Contract logic (policy, reserve-then-commit, refund) is covered separately by the
   15 near-sdk unit tests in `src/lib.rs`.
